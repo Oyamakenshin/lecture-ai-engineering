@@ -4,32 +4,50 @@ import torch
 from transformers import pipeline
 import streamlit as st
 import time
-from config import MODEL_NAME
+from config import MODEL_NAME as DEFAULT_MODEL
 from huggingface_hub import login
 
 # モデルをキャッシュして再利用
 @st.cache_resource
-def load_model():
+def load_model(selected_model: str):
     """LLMモデルをロードする"""
     try:
-
-        # アクセストークンを保存
+        # Hugging Face のトークンでログイン
         hf_token = st.secrets["huggingface"]["token"]
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        st.info(f"Using device: {device}") # 使用デバイスを表示
+        login(token=hf_token)
+
+        # 使用デバイスの判定
+        device = 0 if torch.cuda.is_available() else -1
+        st.info(f"Using device: {'cuda' if device == 0 else 'cpu'}")
+
+        # パイプラインの生成
         pipe = pipeline(
             "text-generation",
-            model=MODEL_NAME,
-            model_kwargs={"torch_dtype": torch.bfloat16},
-            device=device
+            model=selected_model,
+            device=device,
+            torch_dtype=torch.bfloat16 if device == 0 else None,
+            # trust_remote_code=True  # 必要に応じて有効化
         )
-        st.success(f"モデル '{MODEL_NAME}' の読み込みに成功しました。")
+
+        st.success(f"モデル '{selected_model}' の読み込みに成功しました。")
         return pipe
+
     except Exception as e:
-        st.error(f"モデル '{MODEL_NAME}' の読み込みに失敗しました: {e}")
-        st.error("GPUメモリ不足の可能性があります。不要なプロセスを終了するか、より小さいモデルの使用を検討してください。")
+        st.error(f"モデル '{selected_model}' の読み込みに失敗しました: {e}")
         return None
+
+def select_model_ui():
+    """サイドバーにモデル選択UIを追加して、選択したモデル名を返す"""
+    st.sidebar.header("🔄 モデル選択")
+    # ここに好きなモデル名を追加してください
+    model_options = [
+        DEFAULT_MODEL,
+        "gpt2",
+        "gpt2-medium",
+        "distilgpt2",
+        "meta-llama/Llama-2-7b-chat-hf",
+    ]
+    return st.sidebar.selectbox("使用するLLMモデル", model_options, index=model_options.index(DEFAULT_MODEL))
 
 def generate_response(pipe, user_question):
     """LLMを使用して質問に対する回答を生成する"""
@@ -38,50 +56,38 @@ def generate_response(pipe, user_question):
 
     try:
         start_time = time.time()
-        messages = [
-            {"role": "user", "content": user_question},
-        ]
-        # max_new_tokensを調整可能にする（例）
-        outputs = pipe(messages, max_new_tokens=512, do_sample=True, temperature=0.7, top_p=0.9)
+        # text-generation パイプラインには文字列だけ渡します
+        full_text = pipe(
+            user_question,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9
+        )[0]["generated_text"]
 
-        # Gemmaの出力形式に合わせて調整が必要な場合がある
-        # 最後のassistantのメッセージを取得
-        assistant_response = ""
-        if outputs and isinstance(outputs, list) and outputs[0].get("generated_text"):
-           if isinstance(outputs[0]["generated_text"], list) and len(outputs[0]["generated_text"]) > 0:
-               # messages形式の場合
-               last_message = outputs[0]["generated_text"][-1]
-               if last_message.get("role") == "assistant":
-                   assistant_response = last_message.get("content", "").strip()
-           elif isinstance(outputs[0]["generated_text"], str):
-               # 単純な文字列の場合（古いtransformers？） - プロンプト部分を除く処理が必要かも
-               # この部分はモデルやtransformersのバージョンによって調整が必要
-               full_text = outputs[0]["generated_text"]
-               # 簡単な方法：ユーザーの質問以降の部分を取得
-               prompt_end = user_question
-               response_start_index = full_text.find(prompt_end) + len(prompt_end)
-               # 応答部分のみを抽出（より堅牢な方法が必要な場合あり）
-               possible_response = full_text[response_start_index:].strip()
-               # 特定の開始トークンを探すなど、モデルに合わせた調整
-               if "<start_of_turn>model" in possible_response:
-                    assistant_response = possible_response.split("<start_of_turn>model\n")[-1].strip()
-               else:
-                    assistant_response = possible_response # フォールバック
-
-        if not assistant_response:
-             # 上記で見つからない場合のフォールバックやデバッグ
-             print("Warning: Could not extract assistant response. Full output:", outputs)
-             assistant_response = "回答の抽出に失敗しました。"
-
-
+        # ユーザー入力以降を抽出（プロンプトが残る場合の簡易処理）
+        response = full_text.split(user_question, 1)[-1].strip()
         end_time = time.time()
-        response_time = end_time - start_time
-        print(f"Generated response in {response_time:.2f}s") # デバッグ用
-        return assistant_response, response_time
+
+        return response, end_time - start_time
 
     except Exception as e:
         st.error(f"回答生成中にエラーが発生しました: {e}")
-        # エラーの詳細をログに出力
-        import traceback
-        traceback.print_exc()
         return f"エラーが発生しました: {str(e)}", 0
+
+# --- Streamlit アプリ本体での呼び出し例 ---
+if __name__ == "__main__":
+    st.title("LLM Chat デモ")
+
+    # (1) モデル選択 UI
+    model_name = select_model_ui()
+
+    # (2) モデルロード
+    pipe = load_model(model_name)
+
+    # (3) 質問入力 & 回答生成
+    user_input = st.text_input("あなたの質問", "")
+    if user_input:
+        answer, latency = generate_response(pipe, user_input)
+        st.markdown(f"**回答**: {answer}")
+        st.caption(f"生成時間: {latency:.2f} 秒")
